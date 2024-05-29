@@ -1,6 +1,6 @@
 # KMC
 
-This project is a Python application that uses the Kinetic Monte Carlo method to simulate and analyze a system.
+This project is a Python application that uses the Kinetic Monte Carlo method to simulate and analyze a orthogonal crystal lattice. It supports sampling energies from an arbitrary distribution but by default it is a normal distribution. It supports N dim SC lattices and 1-3 dims FCC or BCC lattices. 
 
 ## Getting Started
 
