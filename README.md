@@ -73,3 +73,14 @@ The `fitting_test` notebook is an example on how to use the `analysis` module to
 ## Built With
 
 - [Python](https://www.python.org/)
+
+## ACKs
+
+```
+Acknowledgment: "This material is based on work supported by the National Science Foundation under Grant Nos. MRI# 2024205, MRI# 1725573, and CRI# 2010270."
+Disclaimer: "Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the National Science Foundation."
+```
+
+```
+Clemson University is acknowledged for their generous allotment of compute time on the Palmetto Cluster.
+```
