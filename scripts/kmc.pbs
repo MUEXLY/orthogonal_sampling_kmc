@@ -1,0 +1,33 @@
+#!/bin/bash
+
+#PBS -N kmc_A_XD_YSigma
+#PBS -l select=1:ncpus=52:mem=200gb:chip_type=6230r:interconnect=any,walltime=6:00:00
+#PBS -o /home/user/kmc_out/kmc.run_A_X_Y.out
+#PBS -e /home/user/kmc_out/kmc.run_A_X_Y.err
+
+# This is a formatted kmc.pbs file that will be used to generate multiple pbs files with different parameters
+# It is meant to be used with the generate_jobs.sh script
+# It is meant to be ran on the login node of the palmetto cluster
+# You will have to update all instances of user with your username
+# It assumes that the KMC is located in the /scratch/user/KMC directory
+# It will try to choose some of the nodes in the skylight cluster (Thank you Mercury Consortium)
+# The 6 hour walltime is excessive for this job, but it is meant to be a placeholder
+
+module add anaconda3/2022.10-gcc/9.5.0
+
+echo "starting KMC"
+cd /scratch/user/KMC || exit
+mkdir -p analysis_many_dims/run_A/
+mkdir -p dumps_many_dims/run_A/
+python3 run.py \
+-t 1000 \
+-init-sd 0 \
+-count 600 \
+-dump_every 100 \
+-num_steps 100_000 \
+-lattice_type sc \
+-analysis_file_out 'analysis_many_dims/run_A/1000_XD_Y_Sigma.txt' \
+-dump_pattern 'dumps_many_dims/run_A/dumps_XD_Y_Sigma/dump.1000.*.xz' \
+-lattice_dimensions Z \
+-saddle-sd Y
+exit

@@ -1,0 +1,6 @@
+/dumps/
+/notebooks/.ipynb_checkpoints/
+/temp/
+/.idea/
+*/__pycache__/
+*.pyc
