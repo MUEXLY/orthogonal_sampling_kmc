@@ -206,9 +206,6 @@ def parse_command_line_arguments() -> dict:
         elif arg == '-verbose':
             arguments_dict['verbose'] = True
 
-        if i + 1 >= len(arguments):
-            raise ValueError('Argument not followed by value.')
-
         if arg == '-t':
             arguments_dict['temperature'] = float(arguments[i + 1])
         elif arg == '-csv':
