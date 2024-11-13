@@ -1,1 +1,2 @@
 from analysis.diffusivity import DumpAnalyzer
+from analysis.additional_analyzer import AdditionalAnalyzer

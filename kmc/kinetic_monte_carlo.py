@@ -1,9 +1,13 @@
 import lzma
 import numpy as np
 import time
-from multiprocessing import Pool, Manager, Process
+import threading as th
+from multiprocessing import Pool, Manager
 from dataclasses import dataclass
-from typing import Tuple, IO, Union, List
+from typing import Tuple, IO, Union, List, Dict, Sequence
+
+import tqdm
+
 from kmc.lattice import Lattice, LatInfo, OrthogonalLattice
 from bisect import bisect_left
 from random import seed, randint
@@ -22,6 +26,8 @@ class KMCInfo:
     initial_info: ECInfo
     saddle_info: ECInfo
     temp: float
+    additional_info: bool
+    energy_barrier_keys: List[float]
 
 
 @dataclass
@@ -44,12 +50,15 @@ class KineticMonteCarlo:
     num_sites: int
     curr_step: int
     time: float
+    additional_info: bool
+    barriers_crossed: Dict[float, int]
     rate_prefactor: float = 1e+13
     testing: bool = False
 
+
     def __init__(self, crystal: Union[Lattice, None] = None, initial_energies: Union[EnergyContainer, None] = None,
                  saddle_energies: Union[EnergyContainer, None] = None, temp: float = 300, rand_seed: int = None,
-                 kmc_info: Union[KMCInfo, None] = None):
+                 kmc_info: Union[KMCInfo, None] = None, additional_info = False):
         """
         Initialize a kinetic Monte Carlo simulation
         :param crystal: Crystal to perform the simulation on
@@ -57,12 +66,15 @@ class KineticMonteCarlo:
         :param saddle_energies: Saddle energies of the crystal
         :param temp: Temperature of the simulation
         :param kmc_info: Information about the simulation
+        :param additional_info: Flag to store how many times each barrier was crossed
         """
         if kmc_info is not None:
             self.__init_from_info(kmc_info)
             return
         if crystal is None or initial_energies is None or saddle_energies is None:
             raise ValueError('Must provide a crystal, initial energies, and saddle energies or KMCInfo')
+        self.additional_info = additional_info
+        self.barriers_crossed = {}
         self.crystal = crystal
         self.boundary_crossings = np.zeros(self.crystal.bounds.shape[0], dtype=int)
         self.num_sites = self.crystal.num_sites
@@ -83,6 +95,19 @@ class KineticMonteCarlo:
         self.rates = np.zeros(self.crystal.coordination_number)
         self.transition_states = np.zeros(self.rates.shape, dtype=int)
         self._build_dump_cache()
+        self._init_barriers_map()
+
+    def _init_barriers_map(self):
+        if not self.additional_info:
+            return
+        for site, init in enumerate(self.initial_energies):
+            adjacent = self.saddle_energies[site, :]
+            for saddle in adjacent:
+                if not saddle:
+                    continue
+                barrier_energy = float(saddle - init)
+                self.barriers_crossed[barrier_energy] = 0
+
 
     def _build_dump_cache(self):
         """
@@ -100,6 +125,11 @@ class KineticMonteCarlo:
 
     def __init_from_info(self, kmc_info: KMCInfo):
         self.original = False
+        self.additional_info = kmc_info.additional_info
+        if self.additional_info:
+            self.barriers_crossed={}
+        for i in kmc_info.energy_barrier_keys:
+            self.barriers_crossed[i] = 0
         self.crystal = OrthogonalLattice(lat_info=kmc_info.lat_info)
         self.num_sites = self.crystal.num_sites
         self.initial_energies_obj = EnergyContainer(ec_info=kmc_info.initial_info)
@@ -124,7 +154,9 @@ class KineticMonteCarlo:
             lat_info=self.crystal.get_lat_info(),
             initial_info=self.initial_energies_obj.get_ec_info(),
             saddle_info=self.saddle_energies_obj.get_ec_info(),
-            temp=self.temp
+            temp=self.temp,
+            additional_info = self.additional_info,
+            energy_barrier_keys = list(self.barriers_crossed)
         )
 
     @property
@@ -140,6 +172,16 @@ class KineticMonteCarlo:
         else:
             self.crystal.dump(file, timestep=(self.curr_step, self.time), atom_id=atom_id, suppress_warning=True,
                               additional_labels=self.dump_cache, additional_coords=[self.boundary_crossings])
+
+    def store_additional(self, file:IO):
+        file.write('Energy Stats\n')
+        file.write(f'Initial Mean: {str(np.mean(self.initial_energies))}\n')
+        file.write(f'Initial Sigma: {str(np.std(self.initial_energies))}\n')
+        file.write(f'Saddle Mean: {str(np.mean(self.saddle_energies))}\n')
+        file.write(f'Saddle Sigma: {str(np.std(self.saddle_energies))}\n')
+        file.write(f'Barriers Crossed\n')
+        for key, val in self.barriers_crossed.items():
+            file.write(f'{str(key)}\t{str(val)}\n')
 
     def step(self):
         """
@@ -179,12 +221,15 @@ class KineticMonteCarlo:
         previous_vacancy = self.vacancy_id
         self.vacancy_id = int(sorted_states[event_index])
         assert self.vacancy_id is not None and self.vacancy_id != previous_vacancy
+        if self.additional_info:
+            barrier_energy = float(self.saddle_energies[previous_vacancy][self.vacancy_id] - self.initial_energies[previous_vacancy])
+            self.barriers_crossed[barrier_energy] += 1
 
         # We have to update the boundary crossings
         self.boundary_crossings += self.crystal.crossed_boundary(previous_vacancy, self.vacancy_id)
 
     def run(self, steps: int, vacancy_dump_file: IO, whole_lattice_dump_file: IO = None, dump_lat_every: int = None,
-            verbose: bool = True, async_queue=None) -> None:
+            verbose: bool = True, async_queue=None, additional_file:IO = None) -> None:
         """
         Run the simulation for a number of steps
         :param verbose: Print status updates
@@ -193,6 +238,7 @@ class KineticMonteCarlo:
         :param whole_lattice_dump_file: File to dump whole lattice trajectory to
         :param dump_lat_every: Dump the whole lattice every this many steps
         :param async_queue: Queue to put status updates in when using run_many
+        :param additional_file if additional info is enabled, here is where it would be saved
         """
         assert self.vacancy_id is not None
         start_time = time.time()
@@ -209,47 +255,56 @@ class KineticMonteCarlo:
                 time_elapsed = time.time() - start_time
                 time_total = time_elapsed / (i + 1) * steps
                 print(f'Completed step {i} of {steps}|{time_elapsed:.2f}s / {time_total:.2f}s', end='\r')
-            if async_queue is not None and i % 10_000 == 0:
+            if i != 0 and async_queue is not None and i % 10_000 == 0:
                 async_queue.put(i)
         if verbose:
             print(
                 f'Completed step {steps} of {steps}|{time.time() - start_time:.2f}s / {time.time() - start_time:.2f}s')
         if async_queue is not None:
             async_queue.put(-1)  # Signal that the simulation is done
+        if self.additional_info and additional_file is not None:
+            self.store_additional(additional_file)
+
+    @staticmethod
+    def _open_file(file_name: str, encoding: str, read = False) -> IO:
+        if not read:
+            if file_name.endswith('.xz'):
+                return lzma.open(file_name, mode='wt', encoding=encoding)
+            return open(file_name, mode='w', encoding=encoding)
+        if file_name.endswith('.xz'):
+            return lzma.open(file_name, mode='rt', encoding=encoding)
+        return open(file_name, mode='r', encoding=encoding)
 
     @staticmethod
     def _single_thread_run(kmc_info: KMCInfo, steps: int, vacancy_dump_file_name: str, file_encoding: str,
-                           dump_every_n: int, queue) -> None:
+                           dump_every_n: int, queue, additional_file_name: str = None) -> None:
         kmc = KineticMonteCarlo(kmc_info=kmc_info)
-        if vacancy_dump_file_name.endswith('.xz'):
-            with lzma.open(vacancy_dump_file_name, 'wt', encoding=file_encoding) as vacancy_dump_file:
-                kmc.run(steps, vacancy_dump_file, verbose=False, dump_lat_every=dump_every_n, async_queue=queue)
-            return
-        with open(vacancy_dump_file_name, 'w', encoding=file_encoding) as vacancy_dump_file:
-            kmc.run(steps, vacancy_dump_file, verbose=False, dump_lat_every=dump_every_n, async_queue=queue)
+        vacancy_dump_file = kmc._open_file(vacancy_dump_file_name, file_encoding)
+        additional_file = None
+        if additional_file_name is not None:
+            additional_file = kmc._open_file(additional_file_name, file_encoding)
+        kmc.run(steps, vacancy_dump_file, verbose=False, dump_lat_every=dump_every_n, async_queue=queue,
+                additional_file=additional_file)
+        vacancy_dump_file.close()
+        if additional_file is not None:
+            additional_file.close()
+
 
     @staticmethod
-    def _printer_thread(runs, start_time, total_steps, queue):
+    def _printer_thread(runs, total_steps, queue):
         if queue is None:
             return
         threads_done = 0
-        steps_completed = 0
-        print(f'Running {runs} simulations for {total_steps} steps...')
-        while threads_done < runs:
-            status = queue.get()
-            if status == -1:
-                threads_done += 1
-                continue
-            steps_completed += 10_000
-            time_elapsed = time.time() - start_time
-            time_total = time_elapsed / steps_completed * total_steps
-            print(f'Completed step {steps_completed} of {total_steps}|{time_elapsed:.2f}s / {time_total:.2f}s',
-                  end='\r')
-        print(
-            f'Finished running {runs} simulations for {total_steps} steps! Total time: {time.time() - start_time:.2f}s')
+        with tqdm.tqdm(total=total_steps, unit='steps') as pbar:
+            while threads_done < runs:
+                status = queue.get()
+                if status == -1:
+                    threads_done += 1
+                    continue
+                pbar.update(10_000)
 
-    def run_many(self, steps: int, vacancy_dump_files: Union[Tuple[str, ...], List[str]], file_encoding: str = 'utf_8',
-                 dump_every_n: int = 1, verbose: bool = True) -> None:
+    def run_many(self, steps: int, vacancy_dump_files: Sequence[str], file_encoding: str = 'utf_8',
+                 dump_every_n: int = 1, verbose: bool = True, additional_files: Sequence[str] = None) -> None:
         """
         Run the simulation for a number of steps, but dump to multiple files
         :param steps: number of steps to run the simulation for
@@ -257,17 +312,24 @@ class KineticMonteCarlo:
         :param file_encoding: encoding of the dump files
         :param dump_every_n: dump to every n files
         :param verbose: print status updates
+        :param additional_files files to store additional info, if enabled
         :return: None
         """
         runs = len(vacancy_dump_files)
         total_steps = steps * runs
         start_time = time.time()
+        if verbose:
+            print(f'Running {runs} simulations for {total_steps} steps...')
+        if additional_files is None:
+            additional_files = [None for _ in range(runs)]
         with Manager() as manager:
             queue = manager.Queue() if verbose else None
-            printer_thread = Process(target=self._printer_thread, args=(runs, start_time, total_steps, queue))
+            printer_thread = th.Thread(target=self._printer_thread, args=(runs, total_steps, queue))
             printer_thread.start()
-            args = [(self.get_kmc_info(), steps, vacancy_dump_files[i], file_encoding, dump_every_n, queue) for i in
-                    range(runs)]
+            args = [(self.get_kmc_info(), steps, vacancy_dump_files[i], file_encoding, dump_every_n, queue,
+                     additional_files[i]) for i in range(runs)]
             with Pool() as pool:
                 pool.starmap(self._single_thread_run, args)
             printer_thread.join()
+        if verbose:
+            print(f'Done: {runs} simulations in {time.time() - start_time}')

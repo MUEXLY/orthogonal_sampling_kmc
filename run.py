@@ -1,7 +1,7 @@
 from typing import Iterable, List
 from typing import Tuple
 from kmc import OrthogonalLattice, SaddleEnergies, InitialEnergies, KineticMonteCarlo
-from analysis import DumpAnalyzer
+from analysis import DumpAnalyzer, AdditionalAnalyzer
 from os import mkdir, path
 import numpy as np
 import csv
@@ -98,6 +98,7 @@ def main(args: dict) -> None:
     num_steps = args['num_steps']
     num_points_analysis = args['num_points_analysis']
     analysis_file_out = args['analysis_file_out']
+    additional_info = args['additional_stats']
     v_print = print if verbose else lambda *a, **k: None
     if init_mean is not None and init_sd is not None and saddle_mean is not None and saddle_sd is not None:
         v_print("Using provided initial and saddle parameters.")
@@ -126,15 +127,24 @@ def main(args: dict) -> None:
     saddle_energies = SaddleEnergies(lattice.get_adjacency_matrix(), np.random.normal, saddle_params,
                                      init_energies=init_energies)
     v_print("Initializing KMC...")
-    kmc = KineticMonteCarlo(lattice, init_energies, saddle_energies, temperature)
+    kmc = KineticMonteCarlo(lattice, init_energies, saddle_energies, temperature, additional_info=additional_info)
     file_list = get_file_list(dump_pattern, dump_iterable)
+    additional_lists = [f'{x}_additional.xz' for x in file_list] if additional_info else None
     create_dirs_in_pattern(dump_pattern, dump_iterable)
     v_print("Running KMC...")
-    kmc.run_many(num_steps, file_list, file_encoding, dump_every_n_steps, verbose)
+    kmc.run_many(num_steps, file_list, file_encoding, dump_every_n_steps, verbose, additional_files=additional_lists)
     # kmc.run(steps=num_steps,vacancy_dump_file=open(file_list[0], 'w', encoding=file_encoding), dump_lat_every=dump_every_n_steps, verbose=verbose)
     v_print("Done!")
     v_print('Starting Analysis...')
     analyzer = DumpAnalyzer(file_list, num_points_analysis, file_encoding)
+    if additional_info:
+        files = [KineticMonteCarlo._open_file(x ,file_encoding, True) for x in additional_lists]
+        additional_out = KineticMonteCarlo._open_file(f'{analysis_file_out}_additional.xz', file_encoding, False)
+        additional_analyzer = AdditionalAnalyzer(files, additional_out)
+        additional_analyzer.analyze()
+        additional_out.close()
+        for f in files:
+            f.close()
     v_print('Done!')
     v_print('Writing analysis to file...')
     with open(analysis_file_out, 'w', encoding=file_encoding) as file:
@@ -165,7 +175,8 @@ def get_default_args() -> dict:
         'init_mean': None,
         'init_sd': None,
         'saddle_mean': None,
-        'saddle_sd': None
+        'saddle_sd': None,
+        'additional_stats': False
     }
 
 
@@ -189,6 +200,7 @@ def print_help():
     print('-init-sd <init_sd>: Initial standard deviation.')
     print('-saddle-mean <saddle_mean>: Saddle mean energy.')
     print('-saddle-sd <saddle_sd>: Saddle standard deviation.')
+    print('-additional_stats: store additional information (actual init/saddle mean and sds and which barriers are crossed)')
     print('\n')
     print('Defaults:')
     args = get_default_args()
@@ -205,8 +217,7 @@ def parse_command_line_arguments() -> dict:
             print_help()
         elif arg == '-verbose':
             arguments_dict['verbose'] = True
-
-        if arg == '-t':
+        elif arg == '-t':
             arguments_dict['temperature'] = float(arguments[i + 1])
         elif arg == '-csv':
             arguments_dict['csv_file'] = arguments[i + 1]
@@ -238,6 +249,8 @@ def parse_command_line_arguments() -> dict:
             arguments_dict['saddle_mean'] = float(arguments[i + 1])
         elif arg == '-saddle-sd':
             arguments_dict['saddle_sd'] = float(arguments[i + 1])
+        elif arg == '-additional_stats':
+            arguments_dict['additional_stats'] = True
     arguments_dict['dump_count'] = range(arguments_dict['count'])
     # delete the count argument
     del arguments_dict['count']
