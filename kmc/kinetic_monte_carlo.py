@@ -177,8 +177,9 @@ class KineticMonteCarlo:
         file.write('Energy Stats\n')
         file.write(f'Initial Mean: {str(np.mean(self.initial_energies))}\n')
         file.write(f'Initial Sigma: {str(np.std(self.initial_energies))}\n')
-        file.write(f'Saddle Mean: {str(np.mean(self.saddle_energies))}\n')
-        file.write(f'Saddle Sigma: {str(np.std(self.saddle_energies))}\n')
+        saddles = self.saddle_energies[np.nonzero(self.saddle_energies)]
+        file.write(f'Saddle Mean: {str(np.mean(saddles))}\n')
+        file.write(f'Saddle Sigma: {str(np.std(saddles))}\n')
         file.write(f'Barriers Crossed\n')
         for key, val in self.barriers_crossed.items():
             file.write(f'{str(key)}\t{str(val)}\n')
