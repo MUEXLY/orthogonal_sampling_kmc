@@ -7,6 +7,7 @@ from warnings import warn
 from itertools import product
 import numpy as np
 import torch
+import sqlite3 as sql
 from numpy.typing import ArrayLike, DTypeLike
 from overrides import overrides
 
@@ -65,6 +66,7 @@ class LatSharedMemory:
         return list(self.__dict__.keys())
 
 
+# noinspection PyTypeChecker
 @dataclass
 class Lattice:
     """
@@ -188,6 +190,35 @@ class Lattice:
     def get_adjacency_matrix(self, epsilon=0.1, strict=False) -> np.ndarray:
         pass
 
+    # noinspection SqlWithoutWhere
+    def write_to_db(self, con: sql.Connection):
+        con.execute('CREATE TABLE IF NOT EXISTS lattice_params (key TEXT PRIMARY KEY, value TEXT)')
+        coords_var = ''
+        coords_names = ''
+        coords_question = ''
+        for i in range(len(self.dimensions)):
+            coords_var += f', x{i} REAL'
+            coords_names += f', x{i}'
+            coords_question += ', ?'
+        con.execute(f'CREATE TABLE IF NOT EXISTS lattice_positions (id INT PRIMARY KEY {coords_var})')
+
+        con.execute('DELETE FROM lattice_params')
+        con.execute('DELETE FROM lattice_positions')
+
+        con.execute('INSERT INTO lattice_params (key, value) VALUES (?, ?)', ('num_sites', self.num_sites))
+        con.execute('INSERT INTO lattice_params (key, value) VALUES (?, ?)', ('coordination_number', self.coordination_number))
+        con.execute('INSERT INTO lattice_params (key, value) VALUES (?, ?)', ('dimensions', ' '.join(map(str, self.dimensions))))
+        con.execute('INSERT INTO lattice_params (key, value) VALUES (?, ?)', ('num_dimensions', len(self.dimensions)))
+        con.execute('INSERT INTO lattice_params (key, value) VALUES (?, ?)', ('lattice_vector', ' '.join(map(str, self.lattice_vector))))
+        con.execute('INSERT INTO lattice_params (key, value) VALUES (?, ?)', ('bounds', ' '.join(map(str, self.bounds))))
+
+        for i, site in enumerate(self.sites):
+            # noinspection SqlInsertValues
+            con.execute(f'INSERT INTO lattice_positions (id {coords_names}) VALUES (? {coords_question})', tuple([i] + list(site)))
+
+        con.commit()
+
+
 
 @dataclass
 class OrthogonalLattice(Lattice):
@@ -235,10 +266,10 @@ class OrthogonalLattice(Lattice):
         if len(dimensions) > 3 and lattice_type != OrthogonalLattice.LatticeType.SC:
             raise ValueError("Only a maximum of 3 dimensions are supported for fcc and bcc lattices")
         # Pad dimensions and lattice_vector to 3 dimensions
-        if len(dimensions) == 1:
+        if len(dimensions) == 1 and lattice_type != OrthogonalLattice.LatticeType.SC:
             dimensions = np.array([dimensions[0], 1, 1])
             lattice_vector = np.ones(3) * lattice_vector[0]
-        elif len(dimensions) == 2:
+        elif len(dimensions) == 2 and lattice_type != OrthogonalLattice.LatticeType.SC:
             dimensions = np.array([dimensions[0], dimensions[1], 1])
             lattice_vector = np.array([lattice_vector[0], lattice_vector[1], 1])
         # Convert to numpy arrays

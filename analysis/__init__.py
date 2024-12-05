@@ -1,2 +1,3 @@
-from analysis.diffusivity import DumpAnalyzer
-from analysis.additional_analyzer import AdditionalAnalyzer
+from .diffusivity import DumpAnalyzer
+from .additional_analyzer import AdditionalAnalyzer
+from .kmcv2 import KMCv2Analyzer
