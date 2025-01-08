@@ -3,3 +3,5 @@ overrides>=7.4.0
 matplotlib>=3.7.0
 torch>=2.1.2
 tqdm>=4.66.3
+
+scipy~=1.14.1
