@@ -1,17 +1,22 @@
 import csv
-from random import shuffle
+import random
+import pandas as pd
+from random import shuffle, randint
+import uuid
 
+from scipy.constants import physical_constants
 from tqdm import tqdm
 
 from analysis import KMCv2Analyzer
 from .lattice import Lattice, OrthogonalLattice
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Dict, Iterable
+from typing import List, Tuple, Dict, Iterable, Any
 from pathlib import Path
 import sqlite3 as sql
 import numpy as np
 import scipy.stats as stats
 import multiprocessing as mp
+
 
 def get_params_from_csv(csv_file: str, file_encoding: str) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     """
@@ -49,19 +54,8 @@ def get_params_from_csv(csv_file: str, file_encoding: str) -> Tuple[Tuple[float,
 class Sampler(ABC):
 
     @staticmethod
-    def _flatten(l:List[int] | Tuple[int,...]) -> int:
-        if len(l) > 2:
-             return Sampler._flatten([Sampler._flatten((l[0], l[1]))] + l[2:])
-        if len(l) == 2:
-            # Cantor pairing function
-            return ((l[0] + l[1]) * (l[0] + l[1] + 1) // 2) + l[1]
-        if len(l) == 1:
-            return l[0]
-        return 0
-
-    @staticmethod
-    def _flatten_sym(l:List[int] | Tuple[int,...]) -> int:
-        return Sampler._flatten(sorted(l))
+    def _index_sym(l:List[int] | Tuple[int,...]) -> Tuple[int,...]:
+        return tuple(sorted(l))
 
     @abstractmethod
     def get_rates(self, idx:int) -> Tuple[np.ndarray[2], float]:
@@ -79,9 +73,9 @@ class Sampler(ABC):
 # noinspection PyTypeChecker
 class DualSampler(Sampler):
     init_energies: np.ndarray
-    saddle_energies: Dict[int, float]
+    saddle_energies: Dict[Tuple[int,int], float]
     neighbors: Dict[int, List[int]]
-    rates: Dict[int, np.ndarray[Tuple[int, float]]]
+    rates: Dict[int, List[Tuple[int, float]]]
     rates_sum: Dict[int, float]
 
     temp: float
@@ -94,6 +88,9 @@ class DualSampler(Sampler):
         self.saddle_energies = {}
         self.neighbors = {}
         self.temp = temp
+
+        temp_energy = temp * physical_constants['Boltzmann constant in eV/K'][0]
+
         self.init_params = init_params
         self.saddle_params = saddle_params
         self.prefactor = prefactor
@@ -101,43 +98,43 @@ class DualSampler(Sampler):
             self.neighbors[i] = []
             for j, val in enumerate(row):
                 if val == 1:
-                    self.saddle_energies[Sampler._flatten_sym((i, j))] = np.random.normal(saddle_params[0], saddle_params[1])
+                    self.saddle_energies[Sampler._index_sym((i, j))] = np.random.normal(saddle_params[0], saddle_params[1])
                     self.neighbors[i].append(j)
 
         for i in range(len(self.init_energies)):
             for n in self.neighbors[i]:
-                if self.saddle_energies[Sampler._flatten_sym((i,n))] < self.init_energies[i]:
-                    self.saddle_energies[Sampler._flatten_sym((i,n))] = float(self.init_energies[i])
+                if self.saddle_energies[Sampler._index_sym((i,n))] < self.init_energies[i]:
+                    self.saddle_energies[Sampler._index_sym((i,n))] = float(self.init_energies[i])
         self.rates = {}
         self.rates_sum = {}
         for i in range(len(self.init_energies)):
             rates = []
+            rates_sum = 0.0
             for n in self.neighbors[i]:
-                rate = prefactor * np.exp(-(self.saddle_energies[Sampler._flatten_sym((i,n))] - self.init_energies[i]) / temp)
+                rate = prefactor * np.exp(-(self.saddle_energies[Sampler._index_sym((i,n))] - self.init_energies[i]) / temp_energy)
                 rates.append((n, rate))
-            self.rates[i] = np.array(rates)
-            self.rates_sum[i] = np.sum(self.rates[i][:,1])
+                rates_sum += rate
+            self.rates[i] = rates
+            self.rates_sum[i] = rates_sum
 
-    def get_rates(self, idx:int) -> Tuple[np.ndarray[2], float]:
-        np.random.shuffle(self.rates[idx])
+    def get_rates(self, idx:int) -> Tuple[List[Tuple[int, float]], float]:
+        shuffle(self.rates[idx])
         return self.rates[idx], self.rates_sum[idx]
 
     def get_random(self) -> int:
-        return np.random.choice(len(self.init_energies))
+        return randint(0, len(self.init_energies)-1)
 
     # noinspection SqlWithoutWhere
     def write_to_db(self, con:sql.Connection) -> None:
         con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_params (key TEXT PRIMARY KEY, value TEXT)')
         con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_init_energies (id INT PRIMARY KEY, energy REAL)')
-        con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_saddle_energies (pair_id INT PRIMARY KEY, energy REAL)')
-        con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_neighbors (pair_id INT PRIMARY KEY, id1 INT, id2 INT)')
+        con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_saddle_energies (i INT, j INT, energy REAL)')
         con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_rates (id INT, neighbor INT, rate REAL)')
         con.execute('CREATE TABLE IF NOT EXISTS dual_sampler_barriers (id INT, neighbor INT, energy REAL)')
 
         con.execute('DELETE FROM dual_sampler_params')
         con.execute('DELETE FROM dual_sampler_init_energies')
         con.execute('DELETE FROM dual_sampler_saddle_energies')
-        con.execute('DELETE FROM dual_sampler_neighbors')
         con.execute('DELETE FROM dual_sampler_rates')
         con.execute('DELETE FROM dual_sampler_barriers')
 
@@ -149,20 +146,13 @@ class DualSampler(Sampler):
         con.execute('INSERT INTO dual_sampler_params (key, value) VALUES ("saddle_sd", ?)', (str(self.saddle_params[1]),))
         con.executemany('INSERT INTO dual_sampler_init_energies (id, energy) VALUES (?, ?)', [(i, e) for i, e in enumerate(self.init_energies)])
         for pair_id in self.saddle_energies:
-            con.execute('INSERT INTO dual_sampler_saddle_energies (pair_id, energy) VALUES (?, ?)', (pair_id, self.saddle_energies[pair_id]))
-        pairs = {}
-        for idx in self.neighbors:
-            for neighbor in self.neighbors[idx]:
-                pair_id = Sampler._flatten_sym((idx, neighbor))
-                if pair_id not in pairs:
-                    pairs[pair_id] = True
-                    con.execute('INSERT INTO dual_sampler_neighbors (pair_id, id1, id2) VALUES (?, ?, ?)', (pair_id, idx, neighbor))
+            con.execute('INSERT INTO dual_sampler_saddle_energies (i,j , energy) VALUES (?, ?, ?)', (pair_id[0], pair_id[1], self.saddle_energies[pair_id]))
         for idx in self.rates:
             for neighbor, rate in self.rates[idx]:
                 con.execute('INSERT INTO dual_sampler_rates (id, neighbor, rate) VALUES (?, ?, ?)', (idx, neighbor, rate))
         for idx in self.neighbors:
             for neighbor in self.neighbors[idx]:
-                energy = self.saddle_energies[Sampler._flatten_sym((idx, neighbor))] - self.init_energies[idx]
+                energy = self.saddle_energies[Sampler._index_sym((idx, neighbor))] - self.init_energies[idx]
                 con.execute('INSERT INTO dual_sampler_barriers (id, neighbor, energy) VALUES (?, ?, ?)', (idx, neighbor, energy))
         con.commit()
 
@@ -174,7 +164,7 @@ class KMCv2:
     sampler: Sampler
     con: sql.Connection
 
-    def __init__(self, sampler:Sampler, con:sql.Connection, commit_every:int = 1000):
+    def __init__(self, sampler:Sampler, con:sql.Connection, commit_every:int = 1_000):
         self.sampler = sampler
         self.con = con
         self.idx = self.sampler.get_random()
@@ -182,15 +172,19 @@ class KMCv2:
 
     def _run_step(self, i):
         rates, total_rate = self.sampler.get_rates(self.idx)
-        r = np.random.rand() * total_rate
+        r = (1.0 - np.random.uniform(low=0, high=1)) * total_rate
+        rate_picked = r
+        done = False
         for n, rate in rates:
             r -= rate
-            if r < 0:
-                self.time += 1 / total_rate
+            if r <= 0:
+                second_draw = (1.0 - np.random.uniform(low=0, high=1))
+                self.time += np.log(1.0/second_draw) * 1.0 / total_rate
                 self.idx = n
+                done = True
                 break
-        else:
-            raise Exception('No rate was selected')
+        if not done:
+            raise Exception(f'No rate was selected. picked: {rate_picked}, total: {total_rate}')
         self.con.execute(f'INSERT INTO kmc (step, time, idx) VALUES ({i}, {self.time}, {self.idx})')
         if i % self.commit_every == 0:
             self.con.commit()
@@ -233,10 +227,14 @@ class KMCv2Runner:
         return '_'.join([val_to_str(x) for x in arr])
 
     def __init__(self, out_dir: Path, dims: List[List[int]], lattice_vectors: List[List[float]],
-                 init_params: List[Tuple[float, float]], saddle_params: List[Tuple[float, float]], temp: float,
-                 lattice_type: str | OrthogonalLattice.LatticeType = 'SC', prefactor: float = 1e13, pos_count:int = 10_000):
+                 init_params: List[Tuple[float, float]], saddle_params: List[Tuple[float, float]], temp: float | Iterable[float],
+                 lattice_type: str | OrthogonalLattice.LatticeType = 'SC', prefactor: float = 1e13, pos_count:int = 100_000):
         count = len(dims)
-        if count != len(lattice_vectors) or count != len(init_params) or count != len(saddle_params):
+        try:
+            _ = (e for e in temp)
+        except TypeError:
+            temp = [temp for _ in range(count)]
+        if count != len(lattice_vectors) or count != len(init_params) or count != len(saddle_params) or count != len(temp):
             raise ValueError('All lists must have the same length')
         self.pos_count = pos_count
         self.out_dir = out_dir
@@ -249,7 +247,7 @@ class KMCv2Runner:
         self.samplers = []
         arr_str = KMCv2Runner.arr_str
         for i in range(count):
-            name = f'{arr_str(dims[i])}D{arr_str(lattice_vectors[i])}V{arr_str(init_params[i])}I{arr_str(saddle_params[i])}S'
+            name = f'{temp[i]}K{arr_str(dims[i])}D{arr_str(lattice_vectors[i])}V{arr_str(init_params[i])}I{arr_str(saddle_params[i])}S'
             self.names.append(name)
             con = sql.connect(self.lattice_dir / f'{name}.db')
             self.cons.append(con)
@@ -258,32 +256,24 @@ class KMCv2Runner:
                 KMCv2Runner.ORTHOGONAL_LATTICES[t] = OrthogonalLattice(lattice_type, dims[i], lattice_vectors[i])
             lattice = KMCv2Runner.ORTHOGONAL_LATTICES[t]
             lattice.write_to_db(con)
-            sampler = DualSampler(lattice, init_params[i], saddle_params[i], temp, prefactor)
+            sampler = DualSampler(lattice, init_params[i], saddle_params[i], temp[i], prefactor)
             sampler.write_to_db(con)
             self.samplers.append(sampler)
-            con.execute('CREATE TABLE IF NOT EXISTS msd_linear (run INT PRIMARY KEY,slope REAL, intercept REAL)')
+            con.execute('CREATE TABLE IF NOT EXISTS msd_linear (run INT PRIMARY KEY,slope REAL, intercept REAL, r REAL)')
 
     @staticmethod
-    def _run_kmc(args) -> (int, int, int, int):
+    def _run_kmc(args) -> (int, int, float, float, float):
+        random.seed(uuid.uuid4().bytes)
         sampler, lattice_db_name, kmc_db_name, steps, pos_count, lat, run = args
         with sql.connect(lattice_db_name) as lattice_con, sql.connect(kmc_db_name) as kmc_con:
-            kmc = KMCv2(sampler, kmc_con)
+            kmc = KMCv2(sampler, kmc_con, commit_every=100_000)
             kmc.run(steps,use_tqdm=False)
             analyzer = KMCv2Analyzer(kmc_con, lattice_con)
             analyzer.calculate_positions(use_tqdm=False)
             analyzer.calculate_msds(pos_count)
             times, msds = analyzer.get_msds()
             linreg = stats.linregress(times, msds)
-            # If the correlation coefficient is less than 0.10, the slope is insignificant
-            if linreg.rvalue**2 < 0.10:
-                slope = 0
-            else:
-                slope = linreg.slope
-
-            # Negative diffusivity is contradictory to Fick's laws
-            # that would mean a poorly fitted line, so low correlation
-            slope = max(0, slope)
-            return lat, run, slope, linreg.intercept
+            return lat, run, linreg.slope, linreg.intercept, linreg.rvalue
 
 
     def run(self, steps:int, runs: Iterable, use_tqdm:bool = True) -> None:
@@ -300,18 +290,80 @@ class KMCv2Runner:
             for res in pool.imap_unordered(KMCv2Runner._run_kmc, args):
                 if pbar is not None:
                     pbar.update(1)
-                lat, run, slope, intercept = res
+                lat, run, slope, intercept, r = res
                 con = self.cons[lat]
-                con.execute('INSERT INTO msd_linear (run, slope, intercept) VALUES (?, ?, ?)', (run, slope, intercept))
+                con.execute('INSERT INTO msd_linear (run, slope, intercept, r) VALUES (?, ?, ?, ?)', (run, slope, intercept, r))
+            for con in self.cons:
                 con.commit()
             if pbar is not None:
                 pbar.close()
 
-    def get_slopes(self) -> List[np.ndarray]:
-        slopes = []
+class KMCv2Viewer:
+    def __init__(self, data_dir: Path, dims: List[List[int]], lattice_vectors: List[List[float]],
+                 init_params: List[Tuple[float, float]], saddle_params: List[Tuple[float, float]],
+                 temp: float | Iterable[float]):
+        count = len(dims)
+        try:
+            _ = (e for e in temp)
+        except TypeError:
+            temp = [temp for _ in range(count)]
+        if count != len(lattice_vectors) or count != len(init_params) or count != len(saddle_params) or count != len(temp):
+            raise ValueError('All lists must have the same length')
+        self.lattice_dir = data_dir / 'lattices'
+        arr_str = KMCv2Runner.arr_str
+        self.cons = []
+        self.names = []
+        for i in range(count):
+            name = f'{temp[i]}K{arr_str(dims[i])}D{arr_str(lattice_vectors[i])}V{arr_str(init_params[i])}I{arr_str(saddle_params[i])}S'
+            self.names.append(name)
+            con = sql.connect(self.lattice_dir / f'{name}.db')
+            self.cons.append(con)
+
+
+    def get_slopes(self) -> pd.DataFrame:
+        df = pd.DataFrame(columns=['dims','init_sd','saddle_sd','slope', 'temp', 'R_val'])
         for con in self.cons:
             cur = con.cursor()
-            cur.execute('SELECT slope FROM msd_linear ORDER BY run')
-            slopes.append(np.array(cur.fetchall()))
-        return slopes
+            cur.execute('SELECT slope, r FROM msd_linear ORDER BY run')
+            slopes_arr = []
+            r_vals_arr = []
+            for row in cur.fetchall():
+                slopes_arr.append(row[0])
+                r_vals_arr.append(row[1])
+            sampler_params = cur.execute('SELECT * FROM dual_sampler_params').fetchall()
+            lattice_params = cur.execute('SELECT * FROM lattice_params').fetchall()
+            dims = None
+            for key, val in lattice_params:
+                if key == 'dimensions':
+                    dims = tuple([int(x) for x in str(val).split()])
+                    break
 
+            if dims is None:
+                continue
+
+            init_sd = None
+            saddle_sd = None
+            temp = None
+            for key, val in sampler_params:
+                if key == 'saddle_sd':
+                    saddle_sd = float(val)
+                    continue
+                if key == 'init_sd':
+                    init_sd = float(val)
+                    continue
+                if key == 'temp':
+                    temp = float(val)
+            if saddle_sd is None or init_sd is None or temp is None:
+                print(f'Invalid sd for {dims}')
+                continue
+            for slope, r in zip(slopes_arr, r_vals_arr):
+                data = {
+                    'dims' : dims,
+                    'init_sd' : init_sd,
+                    'saddle_sd' : saddle_sd,
+                    'slope': slope,
+                    'temp' : temp,
+                    'R_val' : r
+                }
+                df.loc[len(df)] = data
+        return df

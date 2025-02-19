@@ -1,5 +1,7 @@
 import sqlite3 as sql
 from typing import Tuple
+from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import torch as tn
@@ -34,13 +36,16 @@ class KMCv2Analyzer:
         prev_pos = None
         true_prev_pos = None
         first = True
+        pos_dict = {}
         while True:
             row = cur.fetchone()
             if row is None:
                 break
             idx, step = row
-            cur1.execute(f'SELECT {pos_str} FROM lattice_positions WHERE id = ?', (idx,))
-            row = cur1.fetchone()
+            if idx not in pos_dict:
+                cur1.execute(f'SELECT {pos_str} FROM lattice_positions WHERE id = ?', (idx,))
+                pos_dict[idx] = cur1.fetchone()
+            row = pos_dict[idx]
             if row is None:
                 break
             pos = np.array(row)
@@ -104,19 +109,51 @@ class KMCv2Analyzer:
         self.kmc_con.commit()
 
     def _evenly_spaced_pos(self, num_points: int, max_time:float, dims:int) -> (np.ndarray, np.ndarray):
+
+        class Stepper:
+            cursor: sql.Cursor
+            step_queue = deque()
+            all_steps_used = False
+
+            def __init__(self, cursor, max_t):
+                step_query = 'SELECT step, time FROM kmc WHERE time <= ? ORDER BY time'
+                self.cursor = cursor
+                self.cursor.execute(step_query, (max_t,))
+
+            def next(self):
+                if self.all_steps_used:
+                    return None
+                if len(self.step_queue) > 0:
+                    return self.step_queue.popleft()
+                step_buffer = self.cursor.fetchmany(10000)
+                if step_buffer is None:
+                    self.all_steps_used = True
+                    return None
+                for step in step_buffer:
+                    self.step_queue.append(step)
+                return self.step_queue.popleft()
+
         time_points = np.linspace(0, max_time, num_points)
 
-        cur = self.kmc_con.cursor()
-        step_query = 'SELECT step, time FROM kmc WHERE time <= ? ORDER BY time'
-        all_steps = cur.execute(step_query, (max_time,)).fetchall()
 
-        steps = np.array(all_steps, dtype=[('step', int), ('time', float)])
-
+        stepper = Stepper(self.kmc_con.cursor(), max_time)
         matched_steps = []
-        for time_point in time_points:
-            closest_step = steps[steps['time'] <= time_point][-1]['step']
-            matched_steps.append(closest_step)
 
+        prev_step = stepper.next()
+
+        if prev_step is None:
+            raise Exception('No steps in kmc')
+        for time_point in time_points:
+            while True:
+                if prev_step is None:
+                    matched_steps.append(matched_steps[-1])
+                    break
+                if time_point <= prev_step[1]:
+                    matched_steps.append(prev_step[0])
+                    break
+                prev_step = stepper.next()
+
+        cur = self.kmc_con.cursor()
         needed_steps = set(matched_steps)
         pos_str = ', '.join([f'x{i}' for i in range(dims)])
         position_query = f'SELECT step, {pos_str} FROM positions'
@@ -132,10 +169,11 @@ class KMCv2Analyzer:
         return time_points, positions
 
 
-    def calculate_msds(self, pos_count:int = 20000):
+    def calculate_msds(self, pos_count:int = 20000, dims: int | None = None):
         self._setup_msd_table()
         max_time = float(self.kmc_con.execute('SELECT MAX(time) FROM kmc').fetchone()[0])
-        dims = int(self.lattice_con.execute('SELECT value FROM lattice_params WHERE key = "num_dimensions"').fetchone()[0])
+        if dims is None:
+            dims = int(self.lattice_con.execute('SELECT value FROM lattice_params WHERE key = "num_dimensions"').fetchone()[0])
         time_array, pos_array = self._evenly_spaced_pos(pos_count, max_time, dims)
         # Code adapted from https://stackoverflow.com/questions/69738376/how-to-optimize-mean-square-displacement-for-several-particles-in-two-dimensions/69767209
 
