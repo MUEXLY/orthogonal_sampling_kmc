@@ -213,7 +213,7 @@ class KMCv2Runner:
     cons: List[sql.Connection]
     names: List[str]
     samplers: List[DualSampler]
-    pos_count: int
+    n_samples: int
 
     ORTHOGONAL_LATTICES = {}
 
@@ -228,7 +228,7 @@ class KMCv2Runner:
 
     def __init__(self, out_dir: Path, dims: List[List[int]], lattice_vectors: List[List[float]],
                  init_params: List[Tuple[float, float]], saddle_params: List[Tuple[float, float]], temp: float | Iterable[float],
-                 lattice_type: str | OrthogonalLattice.LatticeType = 'SC', prefactor: float = 1e13, pos_count:int = 100_000):
+                 lattice_type: str | OrthogonalLattice.LatticeType = 'SC', prefactor: float = 1e13, n_samples=100):
         count = len(dims)
         try:
             _ = (e for e in temp)
@@ -236,7 +236,7 @@ class KMCv2Runner:
             temp = [temp for _ in range(count)]
         if count != len(lattice_vectors) or count != len(init_params) or count != len(saddle_params) or count != len(temp):
             raise ValueError('All lists must have the same length')
-        self.pos_count = pos_count
+        self.n_samples = n_samples
         self.out_dir = out_dir
         self.lattice_dir = out_dir / 'lattices'
         self.kmc_dir = out_dir / 'kmc'
@@ -259,21 +259,22 @@ class KMCv2Runner:
             sampler = DualSampler(lattice, init_params[i], saddle_params[i], temp[i], prefactor)
             sampler.write_to_db(con)
             self.samplers.append(sampler)
-            con.execute('CREATE TABLE IF NOT EXISTS msd_linear (run INT PRIMARY KEY,slope REAL, intercept REAL, r REAL)')
+            con.execute('CREATE TABLE IF NOT EXISTS msd_linear (run INT PRIMARY KEY,slope REAL, intercept REAL, r REAL, max_dt REAL)')
 
     @staticmethod
     def _run_kmc(args) -> (int, int, float, float, float):
         random.seed(uuid.uuid4().bytes)
-        sampler, lattice_db_name, kmc_db_name, steps, pos_count, lat, run = args
+        sampler, lattice_db_name, kmc_db_name, steps, n_samples, lat, run = args
         with sql.connect(lattice_db_name) as lattice_con, sql.connect(kmc_db_name) as kmc_con:
             kmc = KMCv2(sampler, kmc_con, commit_every=100_000)
             kmc.run(steps,use_tqdm=False)
             analyzer = KMCv2Analyzer(kmc_con, lattice_con)
             analyzer.calculate_positions(use_tqdm=False)
-            analyzer.calculate_msds(pos_count)
+            analyzer.calculate_msds(500_000)
             times, msds = analyzer.get_msds()
-            linreg = stats.linregress(times, msds)
-            return lat, run, linreg.slope, linreg.intercept, linreg.rvalue
+            index = np.searchsorted(times, times[-1]/n_samples)
+            linreg = stats.linregress(times[:index+1], msds[:index+1])
+            return lat, run, linreg.slope, linreg.intercept, linreg.rvalue, times[index]
 
 
     def run(self, steps:int, runs: Iterable, use_tqdm:bool = True) -> None:
@@ -281,7 +282,7 @@ class KMCv2Runner:
         for i in range(len(self.samplers)):
             for run in runs:
                 args.append((self.samplers[i], self.lattice_dir / f'{self.names[i]}.db',
-                             self.kmc_dir / f'{self.names[i]}-{run}.db', steps, self.pos_count, i, run))
+                             self.kmc_dir / f'{self.names[i]}-{run}.db', steps, self.n_samples, i, run))
         shuffle(args)
         with mp.Pool() as pool:
             pbar = None
@@ -290,9 +291,9 @@ class KMCv2Runner:
             for res in pool.imap_unordered(KMCv2Runner._run_kmc, args):
                 if pbar is not None:
                     pbar.update(1)
-                lat, run, slope, intercept, r = res
+                lat, run, slope, intercept, r, max_dt = res
                 con = self.cons[lat]
-                con.execute('INSERT INTO msd_linear (run, slope, intercept, r) VALUES (?, ?, ?, ?)', (run, slope, intercept, r))
+                con.execute('INSERT INTO msd_linear (run, slope, intercept, r, max_dt) VALUES (?, ?, ?, ?, ?)', (run, slope, intercept, r, max_dt))
             for con in self.cons:
                 con.commit()
             if pbar is not None:
